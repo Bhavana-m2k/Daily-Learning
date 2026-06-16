@@ -1,0 +1,222 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include <U8g2lib.h>
+#include <Wire.h>
+
+#define RED_LED    GPIO_NUM_25
+#define GREEN_LED  GPIO_NUM_26
+#define BLUE_LED   GPIO_NUM_27
+
+#define IR_EMIT    GPIO_NUM_32
+#define IR_RECV    GPIO_NUM_34
+
+#define TRIG_PIN   GPIO_NUM_5
+#define ECHO_PIN   GPIO_NUM_18
+
+#define OLED_SDA   21
+#define OLED_SCL   22
+
+#define DETECT_CM  5.0f
+
+// SSD1306 128x64 I2C
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+
+static void configure_gpio(void)
+{
+    gpio_config_t out_cfg = {
+        .pin_bit_mask = (1ULL << RED_LED) | (1ULL << GREEN_LED) | (1ULL << BLUE_LED)
+                      | (1ULL << IR_EMIT) | (1ULL << TRIG_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&out_cfg);
+
+    gpio_config_t in_cfg = {
+        .pin_bit_mask = (1ULL << IR_RECV) | (1ULL << ECHO_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&in_cfg);
+
+    gpio_set_level(IR_EMIT, 1);
+    gpio_set_level(TRIG_PIN, 0);
+}
+
+static void set_rgb(int r, int g, int b)
+{
+    gpio_set_level(RED_LED,   r);
+    gpio_set_level(GREEN_LED, g);
+    gpio_set_level(BLUE_LED,  b);
+}
+
+static float ultrasonic_read_cm(void)
+{
+    gpio_set_level(TRIG_PIN, 0);
+    esp_rom_delay_us(2);
+    gpio_set_level(TRIG_PIN, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(TRIG_PIN, 0);
+
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 0) {
+        if ((esp_timer_get_time() - start) > 30000) return -1;
+    }
+    int64_t echo_start = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 1) {
+        if ((esp_timer_get_time() - echo_start) > 30000) return -1;
+    }
+    float duration_us = (float)(esp_timer_get_time() - echo_start);
+    return (duration_us * 0.0343f) / 2.0f;
+}
+
+// ── OLED screens ─────────────────────────────────────────────
+
+static void oled_open(void)
+{
+    u8g2.clearBuffer();
+
+    // barrier up (gate open)
+    u8g2.drawRFrame(2, 48, 12, 16, 2);   // gate post
+    u8g2.drawBox(4, 30, 8, 18);           // post body
+    u8g2.drawLine(12, 28, 60, 8);         // barrier arm raised
+    u8g2.drawLine(12, 30, 60, 10);
+
+    // text
+    u8g2.setFont(u8g2_font_logisoso16_tr);
+    u8g2.drawStr(62, 28, "OPEN");
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(62, 44, "Toll Gate");
+    u8g2.drawStr(62, 56, "Pass thru");
+
+    u8g2.sendBuffer();
+}
+
+static void oled_close(void)
+{
+    u8g2.clearBuffer();
+
+    // barrier down (gate closed)
+    u8g2.drawRFrame(2, 16, 12, 48, 2);   // gate post
+    u8g2.drawBox(4, 18, 8, 44);           // post body
+    u8g2.drawLine(12, 20, 124, 22);       // barrier arm horizontal
+    u8g2.drawLine(12, 22, 124, 24);
+    // stripes on barrier
+    for (int i = 0; i < 6; i++) {
+        u8g2.drawLine(20 + i*18, 20, 14 + i*18, 24);
+    }
+
+    // text
+    u8g2.setFont(u8g2_font_logisoso16_tr);
+    u8g2.drawStr(30, 44, "STOP");
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(28, 56, "Gate Closed");
+
+    u8g2.sendBuffer();
+}
+
+static void oled_welcome(void)
+{
+    u8g2.clearBuffer();
+
+    // toll booth icon
+    u8g2.drawRFrame(38, 30, 52, 28, 2);
+    u8g2.drawTriangle(36, 30, 90, 30, 63, 14);
+
+    // text
+    u8g2.setFont(u8g2_font_logisoso16_tr);
+    u8g2.drawStr(4, 16, "TOLL GATE");
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(22, 52, "Please Wait...");
+    u8g2.drawStr(16, 62, "Approach slowly");
+
+    u8g2.sendBuffer();
+}
+// ── State machine ─────────────────────────────────────────────
+
+typedef enum {
+    STATE_IDLE,
+    STATE_GREEN,
+    STATE_RED,
+    STATE_BLUE
+} rgb_state_t;
+
+static void sensor_task(void *arg)
+{
+    rgb_state_t state     = STATE_IDLE;
+    int64_t     red_start = 0;
+
+    set_rgb(0, 0, 0);
+    oled_welcome();   // boot screen
+
+    while (1) {
+        float dist    = ultrasonic_read_cm();
+        int detected  = (dist > 0 && dist <= DETECT_CM);
+
+        switch (state) {
+
+            case STATE_IDLE:
+                if (detected) {
+                    printf("%.1f cm → OPEN / GREEN\n", dist);
+                    set_rgb(0, 1, 0);
+                    oled_open();
+                    state = STATE_GREEN;
+                }
+                break;
+
+            case STATE_GREEN:
+                if (!detected) {
+                    printf("Moved → CLOSE / RED 2s\n");
+                    set_rgb(1, 0, 0);
+                    oled_close();
+                    red_start = esp_timer_get_time();
+                    state = STATE_RED;
+                }
+                break;
+
+            case STATE_RED:
+                if ((esp_timer_get_time() - red_start) >= 2000000LL) {
+                    printf("→ WELCOME / BLUE\n");
+                    set_rgb(0, 0, 1);
+                    oled_welcome();
+                    state = STATE_BLUE;
+                }
+                break;
+
+            case STATE_BLUE:
+                if (detected) {
+                    printf("%.1f cm → OPEN / GREEN\n", dist);
+                    set_rgb(0, 1, 0);
+                    oled_open();
+                    state = STATE_GREEN;
+                }
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void setup()
+{
+    Wire.begin(OLED_SDA, OLED_SCL);
+    u8g2.begin();
+    u8g2.setContrast(255);
+
+    configure_gpio();
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+}
+
+void loop()
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
