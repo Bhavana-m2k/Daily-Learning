@@ -1,0 +1,438 @@
+/*
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║        ATM MACHINE SIMULATION — ESP32 COMPLETE FIRMWARE         ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  Hardware:                                                       ║
+  ║   OLED SSD1306 128x64 (I2C)  SDA=21  SCL=22  [U8g2 library]    ║
+  ║   HC-SR04 Ultrasonic         TRIG=5   ECHO=18 [1kΩ+2kΩ divider]║
+  ║   RGB LED (common cathode)   R=25     G=26    B=27  [220Ω each] ║
+  ║   Active Buzzer              GPIO=19                             ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  RGB LED Color Meaning:                                          ║
+  ║   RED    → Idle / Wrong PIN / Error / Blocked                   ║
+  ║   GREEN  → PIN correct / Balance shown / Transaction done        ║
+  ║   YELLOW → Waiting for card / Waiting for PIN                   ║
+  ║   CYAN   → Person detected                                       ║
+  ║   BLUE   → Dispensing cash (blinking)                           ║
+  ║   OFF    → Reset / Standby                                       ║
+  ╠══════════════════════════════════════════════════════════════════╣
+  ║  SERIAL PROTOCOL (115200 baud)                                   ║
+  ║                                                                  ║
+  ║  Python → ESP32 (INPUT commands):                                ║
+  ║   CARD_IN              card number validated, session started    ║
+  ║   PIN_OK               backend confirmed PIN correct             ║
+  ║   PIN_FAIL             backend says wrong PIN                    ║
+  ║   PIN_BLOCKED          too many wrong attempts                   ║
+  ║   BALANCE:xxxx         show balance on OLED                      ║
+  ║   DISPENSING           start dispensing animation                ║
+  ║   DONE:amt:newbal      transaction complete with details         ║
+  ║   ERROR:INSUFFICIENT_BALANCE                                     ║
+  ║   ERROR:INVALID_AMOUNT                                           ║
+  ║   CARD_OUT             end session / reset                       ║
+  ║   RESET                force reset                               ║
+  ║                                                                  ║
+  ║  ESP32 → Python (OUTPUT status):                                 ║
+  ║   STATUS:BOOT_OK       ESP32 ready after startup                 ║
+  ║   STATUS:PERSON_DETECTED   ultrasonic detected someone           ║
+  ║   STATUS:WAITING_CARD  prompting user to enter card              ║
+  ║   STATUS:WAITING_PIN   card accepted, prompting for PIN          ║
+  ║   STATUS:DISPENSING    dispense animation started                ║
+  ║   STATUS:DONE          transaction complete                      ║
+  ║   STATUS:RESET         session reset to idle                     ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+  Libraries needed (Arduino IDE → Library Manager):
+    - U8g2  by oliver  (search "U8g2")
+
+  Board: ESP32 Dev Module
+  Upload Speed: 115200
+  Partition Scheme: Default
+*/
+
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// ═══════════════════════════════════════════════════════════════════
+//  OLED — SSD1306 128x64 via Hardware I2C (SDA=21, SCL=22)
+// ═══════════════════════════════════════════════════════════════════
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ═══════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════
+#define TRIG_PIN    5    // HC-SR04 trigger
+#define ECHO_PIN   18    // HC-SR04 echo (use 1kΩ+2kΩ voltage divider)
+#define LED_R      25    // RGB Red   (220Ω series resistor)
+#define LED_G      26    // RGB Green (220Ω series resistor)
+#define LED_B      27    // RGB Blue  (220Ω series resistor)
+#define BUZZER     19    // Active buzzer (HIGH = ON)
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+#define DETECT_DIST_CM   30    // Person detection threshold in cm
+#define MAX_PIN_TRIES     3    // Max attempts (display only; backend enforces)
+#define SERIAL_BAUD  115200
+
+// ═══════════════════════════════════════════════════════════════════
+//  STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════
+typedef enum {
+  STATE_IDLE,             // Waiting for person
+  STATE_PERSON_DETECTED,  // Just detected, transitioning
+  STATE_WAITING_CARD,     // Prompting card entry on dashboard
+  STATE_WAITING_PIN,      // Card accepted, prompting PIN
+  STATE_SELECT_AMOUNT,    // PIN correct, prompting amount
+  STATE_DISPENSING,       // Cash being dispensed
+  STATE_DONE,             // Transaction complete
+  STATE_BLOCKED           // Card blocked after too many wrong PINs
+} ATMState;
+
+ATMState currentState = STATE_IDLE;
+
+// ═══════════════════════════════════════════════════════════════════
+//  GLOBAL VARIABLES
+// ═══════════════════════════════════════════════════════════════════
+int    pinAttempts = 0;    // Local display counter (backend is master)
+String serialBuf   = "";   // Serial line accumulation buffer
+
+// ═══════════════════════════════════════════════════════════════════
+//  FORWARD DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════
+void  handleSerial(String cmd);
+void  setRGB(bool r, bool g, bool b);
+float getDistance();
+void  oledShow(const char* l1, const char* l2, const char* l3);
+void  oledShowLarge(const char* title, const char* value);
+void  buzzerBeep(int times);
+void  buzzerLongBeep();
+void  resetATM();
+void  startupAnimation();
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+
+  // GPIO init
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_R,    OUTPUT);
+  pinMode(LED_G,    OUTPUT);
+  pinMode(LED_B,    OUTPUT);
+  pinMode(BUZZER,   OUTPUT);
+
+  // Safe defaults
+  setRGB(0, 0, 0);
+  digitalWrite(BUZZER, LOW);
+
+  // OLED init
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();
+
+  // Startup animation
+  startupAnimation();
+
+  // Ready state
+  setRGB(1, 0, 0);   // RED = idle/ready
+  oledShow("ATM Ready", "Stand near sensor", "to begin");
+
+  Serial.println("STATUS:BOOT_OK");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN LOOP
+// ═══════════════════════════════════════════════════════════════════
+void loop() {
+
+  // ── Read serial from Python ──────────────────────────────────────
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      handleSerial(serialBuf);
+      serialBuf = "";
+    } else if (c != '\r') {
+      serialBuf += c;
+    }
+  }
+
+  // ── Person detection (IDLE only) ─────────────────────────────────
+  if (currentState == STATE_IDLE) {
+    float dist = getDistance();
+    if (dist > 0 && dist < DETECT_DIST_CM) {
+      currentState = STATE_PERSON_DETECTED;
+
+      // Welcome
+      setRGB(0, 1, 1);    // CYAN = person detected
+      oledShow("  WELCOME!", "Please enter your", "Card No above");
+      buzzerBeep(1);
+      Serial.println("STATUS:PERSON_DETECTED");
+      delay(1000);
+
+      // Move to waiting card
+      currentState = STATE_WAITING_CARD;
+      setRGB(1, 1, 0);    // YELLOW = waiting card
+      oledShow("Card No:", "Enter on", "Dashboard above");
+      Serial.println("STATUS:WAITING_CARD");
+    }
+  }
+
+  delay(150);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SERIAL COMMAND HANDLER  (Python → ESP32)
+// ═══════════════════════════════════════════════════════════════════
+void handleSerial(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  // ── CARD_IN ── Python confirmed card, start PIN entry ────────────
+  if (cmd == "CARD_IN") {
+    if (currentState == STATE_WAITING_CARD || currentState == STATE_IDLE) {
+      currentState = STATE_WAITING_PIN;
+      pinAttempts  = 0;
+      setRGB(1, 1, 0);   // YELLOW
+      oledShow("Card Accepted", "Enter your PIN", "on Dashboard");
+      buzzerBeep(1);
+      Serial.println("STATUS:WAITING_PIN");
+    }
+  }
+
+  // ── PIN_OK ── Backend confirmed PIN correct ───────────────────────
+  else if (cmd == "PIN_OK") {
+    pinAttempts  = 0;
+    currentState = STATE_SELECT_AMOUNT;
+    setRGB(0, 1, 0);   // GREEN
+    oledShow("PIN Correct!", "Enter Amount", "on Dashboard");
+    buzzerBeep(1);
+  }
+
+  // ── PIN_FAIL ── Backend says wrong PIN ────────────────────────────
+  else if (cmd == "PIN_FAIL") {
+    pinAttempts++;
+    setRGB(1, 0, 0);   // RED
+    char msg[24];
+    int left = MAX_PIN_TRIES - pinAttempts;
+    sprintf(msg, "%d attempt(s) left", left);
+    oledShow("Wrong PIN!", msg, "Try again");
+    buzzerBeep(2);
+    delay(1500);
+    if (currentState != STATE_BLOCKED) {
+      setRGB(1, 1, 0);   // back to YELLOW
+      oledShow("Enter PIN", "on Dashboard", "");
+    }
+  }
+
+  // ── PIN_BLOCKED ── Too many wrong attempts ────────────────────────
+  else if (cmd == "PIN_BLOCKED") {
+    currentState = STATE_BLOCKED;
+    pinAttempts  = 0;
+    setRGB(1, 0, 0);   // RED
+    oledShow("CARD BLOCKED", "Too many wrong", "PIN attempts!");
+    buzzerLongBeep();
+  }
+
+  // ── BALANCE:xxxx ── Show balance on OLED ─────────────────────────
+  else if (cmd.startsWith("BALANCE:")) {
+    String bal = cmd.substring(8);
+    bal.trim();
+    char line[24];
+    sprintf(line, "Rs. %s", bal.c_str());
+    oledShowLarge("BALANCE", line);
+    setRGB(0, 1, 0);   // GREEN
+    buzzerBeep(1);
+  }
+
+  // ── DISPENSING ── Blue blink animation ───────────────────────────
+  else if (cmd == "DISPENSING") {
+    currentState = STATE_DISPENSING;
+    Serial.println("STATUS:DISPENSING");
+    // Blink BLUE 6 times (~3.6 seconds)
+    for (int i = 0; i < 6; i++) {
+      setRGB(0, 0, 1);
+      oledShow("Dispensing...", "Please collect", "your cash");
+      delay(300);
+      setRGB(0, 0, 0);
+      oledShow("Dispensing...", "Please collect", "your cash");
+      delay(300);
+    }
+  }
+
+  // ── DONE:amount:newbalance ── Transaction complete ────────────────
+  else if (cmd.startsWith("DONE:")) {
+    String payload = cmd.substring(5);
+    int    sep     = payload.indexOf(':');
+    String amt     = payload.substring(0, sep);
+    String bal     = payload.substring(sep + 1);
+
+    currentState = STATE_DONE;
+    setRGB(0, 1, 0);   // GREEN
+    char l2[24], l3[24];
+    sprintf(l2, "Rs.%s given", amt.c_str());
+    sprintf(l3, "Bal:Rs.%s",   bal.c_str());
+    oledShow("CASH READY!", l2, l3);
+    buzzerBeep(2);
+    Serial.println("STATUS:DONE");
+    delay(3500);
+    resetATM();
+  }
+
+  // ── ERROR:INSUFFICIENT_BALANCE ────────────────────────────────────
+  else if (cmd == "ERROR:INSUFFICIENT_BALANCE") {
+    setRGB(1, 0, 0);   // RED
+    oledShow("INSUFFICIENT", "BALANCE!", "Try less amount");
+    buzzerBeep(2);
+    delay(1800);
+    setRGB(0, 1, 0);
+    oledShow("Enter Amount", "on Dashboard", "");
+  }
+
+  // ── ERROR:INVALID_AMOUNT ──────────────────────────────────────────
+  else if (cmd == "ERROR:INVALID_AMOUNT") {
+    setRGB(1, 0, 0);   // RED
+    oledShow("INVALID", "AMOUNT!", "Enter valid Rs.");
+    buzzerBeep(2);
+    delay(1800);
+    setRGB(0, 1, 0);
+    oledShow("Enter Amount", "on Dashboard", "");
+  }
+
+  // ── CARD_OUT / RESET ── End session ──────────────────────────────
+  else if (cmd == "CARD_OUT" || cmd == "RESET") {
+    resetATM();
+    Serial.println("STATUS:RESET");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RGB LED CONTROL
+// ═══════════════════════════════════════════════════════════════════
+void setRGB(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r ? HIGH : LOW);
+  digitalWrite(LED_G, g ? HIGH : LOW);
+  digitalWrite(LED_B, b ? HIGH : LOW);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  HC-SR04 DISTANCE MEASUREMENT
+// ═══════════════════════════════════════════════════════════════════
+float getDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  if (dur == 0) return -1.0;
+  return (float)dur * 0.0343f / 2.0f;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  OLED DISPLAY — 3-LINE MESSAGE
+// ═══════════════════════════════════════════════════════════════════
+void oledShow(const char* l1, const char* l2, const char* l3) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // Header bar
+  u8g2.drawBox(0, 0, 128, 13);
+  u8g2.setDrawColor(0);
+  u8g2.drawStr(2, 10, "   ATM MACHINE");
+  u8g2.setDrawColor(1);
+  u8g2.drawHLine(0, 13, 128);
+
+  // Lines
+  if (l1 && strlen(l1)) u8g2.drawStr(4, 26, l1);
+  if (l2 && strlen(l2)) u8g2.drawStr(4, 42, l2);
+  if (l3 && strlen(l3)) u8g2.drawStr(4, 58, l3);
+
+  u8g2.sendBuffer();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  OLED DISPLAY — LARGE VALUE (for balance display)
+// ═══════════════════════════════════════════════════════════════════
+void oledShowLarge(const char* title, const char* value) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawBox(0, 0, 128, 13);
+  u8g2.setDrawColor(0);
+  u8g2.drawStr(2, 10, "   ATM MACHINE");
+  u8g2.setDrawColor(1);
+  u8g2.drawHLine(0, 13, 128);
+  u8g2.drawStr(4, 28, title);
+  u8g2.drawHLine(0, 31, 128);
+  // Larger font for value
+  u8g2.setFont(u8g2_font_9x15B_tf);
+  u8g2.drawStr(4, 52, value);
+  u8g2.sendBuffer();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  BUZZER
+// ═══════════════════════════════════════════════════════════════════
+void buzzerBeep(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER, HIGH); delay(180);
+    digitalWrite(BUZZER, LOW);  delay(120);
+  }
+}
+
+void buzzerLongBeep() {
+  // Three long beeps for blocked card
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER, HIGH); delay(500);
+    digitalWrite(BUZZER, LOW);  delay(200);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  STARTUP ANIMATION
+// ═══════════════════════════════════════════════════════════════════
+void startupAnimation() {
+  // LED RGB sweep
+  oledShow("ATM Machine", "Initializing...", "Please wait");
+  setRGB(1, 0, 0); delay(300);
+  setRGB(0, 1, 0); delay(300);
+  setRGB(0, 0, 1); delay(300);
+  setRGB(1, 1, 0); delay(300);
+  setRGB(0, 1, 1); delay(300);
+  setRGB(1, 0, 1); delay(300);
+  setRGB(0, 0, 0); delay(200);
+
+  // Progress bar animation on OLED
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(20, 20, "ATM MACHINE v1.0");
+  u8g2.drawStr(10, 36, "Initializing...");
+  u8g2.drawFrame(10, 46, 108, 10);
+  u8g2.sendBuffer();
+
+  for (int w = 0; w <= 104; w += 13) {
+    u8g2.drawBox(12, 48, w, 6);
+    u8g2.sendBuffer();
+    delay(80);
+  }
+  delay(400);
+
+  oledShow("System Ready!", "Connected to", "Python Backend");
+  buzzerBeep(2);
+  delay(800);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RESET ATM SESSION
+// ═══════════════════════════════════════════════════════════════════
+void resetATM() {
+  currentState = STATE_IDLE;
+  pinAttempts  = 0;
+  setRGB(0, 0, 0);
+  digitalWrite(BUZZER, LOW);
+  oledShow("Thank You!", "Have a nice day!", "");
+  delay(2000);
+  setRGB(1, 0, 0);   // RED = idle
+  oledShow("ATM Ready", "Stand near sensor", "to begin");
+}
